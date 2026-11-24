@@ -181,8 +181,10 @@ jobs:
           exec > >(tee "$LOG_DIR/xpra-client.log") 2>&1
           MP=/tmp/xpra-mnt
           mkdir -p "$MP"
+          trap 'hdiutil detach "$MP" -force >/dev/null 2>&1 || true' EXIT
           echo '=== hdiutil attach ==='
-          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MP" /tmp/Xpra.dmg; ATTACH_RC=$?
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MP" /tmp/Xpra.dmg
+          ATTACH_RC=$?
           echo "hdiutil rc=$ATTACH_RC"
           if [ "$ATTACH_RC" -ne 0 ]; then
             echo '::error::hdiutil attach failed'
@@ -192,69 +194,85 @@ jobs:
           echo '=== mounted contents ==='
           ls -la "$MP"
           echo
-          APP=$(find "$MP" -maxdepth 2 -name '*.app' -print -quit)
+          # Search only the top level: the volume contains a non-listable
+          # .Trashes directory, so recursing from the mount root makes `find`
+          # return a permission error (that is what failed run 45465994623).
+          APP=$(find "$MP" -maxdepth 1 -name '*.app' -print 2>/dev/null | head -n 1 || true)
           echo "app_path=$APP"
           if [ -z "${APP:-}" ]; then
             echo '::error::no .app found in mounted DMG'
-            hdiutil detach "$MP" -force || true
             exit 1
           fi
+          echo
+          echo '=== bundle tree (depth 3) ==='
+          find "$APP" -maxdepth 3 2>/dev/null | head -100 || true
           echo
           echo '=== Info.plist (bundle identity) ==='
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist" 2>/dev/null || true
+          PLIST="$APP/Contents/Info.plist"
+          for key in CFBundleIdentifier CFBundleName CFBundleExecutable CFBundleShortVersionString CFBundleVersion; do
+            val=$(/usr/libexec/PlistBuddy -c "Print :$key" "$PLIST" 2>/dev/null || true)
+            echo "$key=$val"
+          done
+          BUNDLE_EXE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" 2>/dev/null || true)
           echo
-          echo '=== bundle executable layout ==='
-          ls -la "$APP/Contents/MacOS" | head -40
+          echo '=== Contents/MacOS layout ==='
+          ls -la "$APP/Contents/MacOS" 2>/dev/null || true
           echo
-          XPRA="$APP/Contents/MacOS/Xpra"
+          XPRA="$APP/Contents/MacOS/${BUNDLE_EXE:-Xpra}"
           if [ ! -x "$XPRA" ]; then
-            echo "::error::missing executable $XPRA"
-            hdiutil detach "$MP" -force || true
+            echo "main executable $XPRA missing/non-executable; searching for an xpra launcher"
+            XPRA=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f -perm -111 -iname '*xpra*' 2>/dev/null | head -n 1 || true)
+          fi
+          echo "xpra_binary=$XPRA"
+          if [ -z "${XPRA:-}" ] || [ ! -x "$XPRA" ]; then
+            echo '::error::no runnable Xpra executable found in bundle'
             exit 1
           fi
-          echo "=== $XPRA --version (60s timeout) ==="
-          python3 - "$XPRA" --version <<'PY' 2>&1 | tail -40
+          file "$XPRA" 2>/dev/null || true
+          echo
+          echo '=== xpra_binary --version (60s timeout) ==='
+          VERSION_LOG="$LOG_DIR/xpra-version.log"
+          python3 - "$XPRA" --version > "$VERSION_LOG" 2>&1 <<'PY'
           import subprocess, sys
           try:
-              r = subprocess.run(sys.argv[1:], timeout=60, capture_output=True, text=True)
+              r = subprocess.run(sys.argv[1:], timeout=60, capture_output=True, text=True, stdin=subprocess.DEVNULL)
               print("exit_code=", r.returncode)
               print("--- stdout ---"); print(r.stdout[-8000:])
               print("--- stderr ---"); print(r.stderr[-8000:])
+              sys.exit(r.returncode)
           except subprocess.TimeoutExpired as e:
               print("TIMEOUT after 60s")
-              print("--- stdout so far ---"); print((e.stdout or b"").decode(errors="replace")[-4000:] if isinstance(e.stdout, bytes) else (e.stdout or "")[-4000:])
-              print("--- stderr so far ---"); print((e.stderr or b"").decode(errors="replace")[-4000:] if isinstance(e.stderr, bytes) else (e.stderr or "")[-4000:])
+              print("--- stdout so far ---"); print((e.stdout or "")[-4000:] if not isinstance(e.stdout, bytes) else e.stdout.decode(errors="replace")[-4000:])
+              print("--- stderr so far ---"); print((e.stderr or "")[-4000:] if not isinstance(e.stderr, bytes) else e.stderr.decode(errors="replace")[-4000:])
               sys.exit(124)
           PY
           VERSION_RC=$?
+          cat "$VERSION_LOG"
           echo "xpra_version_rc=$VERSION_RC"
           echo
-          echo '=== xpra attach --help probe (flag availability) ==='
-          python3 - "$XPRA" attach --help <<'PY' 2>&1 | tee "$LOG_DIR/xpra-attach-help.log" | tail -5
-          import subprocess, sys
+          echo '=== xpra_binary attach --help probe (flag availability, 120s timeout) ==='
+          HELP_LOG="$LOG_DIR/xpra-attach-help.log"
+          python3 - "$XPRA" attach --help > "$HELP_LOG" 2>&1 <<'PY'
+          import subprocess, sys, pathlib, os
           try:
-              r = subprocess.run(sys.argv[1:], timeout=120, capture_output=True, text=True)
+              r = subprocess.run(sys.argv[1:], timeout=120, capture_output=True, text=True, stdin=subprocess.DEVNULL)
               out = r.stdout or ""
-              err = r.stderr or ""
-              print("exit_code=", r.returncode, "stdout_bytes=", len(out), "stderr_bytes=", len(err))
-              import pathlib
-              pathlib.Path(__import__("os").environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stdout.txt").write_text(out)
-              pathlib.Path(__import__("os").environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stderr.txt").write_text(err)
+              print("exit_code=", r.returncode, "stdout_bytes=", len(out), "stderr_bytes=", len(r.stderr or ""))
+              pathlib.Path(os.environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stdout.txt").write_text(out)
+              pathlib.Path(os.environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stderr.txt").write_text(r.stderr or "")
               for flag in ["--sharing", "--clipboard", "--audio", "--encodings", "--quality", "--min-quality",
                            "--speed", "--min-speed", "--video-scaling", "--av-sync", "--opengl", "--dpi",
                            "--no-mdns", "--no-printing", "--no-webcam", "--notifications", "--exit-with-client"]:
                   print(f"flag {flag}: {'present' if flag in out else 'ABSENT'}")
+              sys.exit(r.returncode)
           except subprocess.TimeoutExpired:
               print("TIMEOUT after 120s"); sys.exit(124)
           PY
-          echo "xpra_attach_help_rc=$?"
+          HELP_RC=$?
+          head -40 "$HELP_LOG"
+          echo "xpra_attach_help_rc=$HELP_RC"
           echo
-          echo '=== detach DMG ==='
-          hdiutil detach "$MP" -force
-          echo "detach rc=$?"
-          echo
+          echo "version_rc=$VERSION_RC help_rc=$HELP_RC"
           if [ "$VERSION_RC" -ne 0 ]; then
             echo "::error::Xpra --version exited rc=$VERSION_RC"
             exit 1
