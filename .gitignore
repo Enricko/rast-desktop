@@ -1,0 +1,27 @@
+# Rust
+target/
+**/target/
+*.rs.bk
+
+# Node / Tauri
+node_modules/
+desktop/dist/
+desktop/ui/dist/
+.npm/
+*.tsbuildinfo
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data
+*.log
+*.pid
+/artifacts/
+/results/
+poc/tmp/
+poc/shots/
+.env
+.env.*
