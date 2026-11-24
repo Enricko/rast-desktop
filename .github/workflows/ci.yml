@@ -1,0 +1,240 @@
+name: CI
+
+# Continuous integration for RAST Desktop.
+#
+# Linux job  — repository sanity (workflow YAML parses, shell scripts parse),
+#              then, when the desktop workspace is present:
+#              cargo fmt --check, clippy -D warnings, cargo test, cargo check,
+#              and the launcher UI build.
+# macOS job  — when the desktop workspace is present: cargo test and a real
+#              universal (arm64 + x86_64) `tauri build` producing an unsigned /
+#              ad-hoc signed .dmg (see docs/MACOS-BUILD.md; there is no Apple
+#              Developer ID certificate, so signing and notarization are BLOCKED
+#              and explicitly not claimed).
+#
+# The desktop workspace is owned by other contributors and lands on main
+# incrementally. Until `desktop/src-tauri/Cargo.toml` exists the build/test steps
+# are skipped with a visible notice instead of failing on missing files; the
+# repository-sanity checks still run and must pass.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-check:
+    name: Linux — fmt, clippy, test, check, UI build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect desktop workspace
+        id: desktop
+        run: |
+          if [ -f desktop/src-tauri/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::desktop/src-tauri/Cargo.toml is not present on this ref yet — build/test steps are skipped, repository sanity still runs."
+          fi
+
+      - name: Repository sanity — workflow YAML + shell script syntax
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --user pyyaml
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          files = sorted(glob.glob('.github/workflows/*.yml') + glob.glob('.github/workflows/*.yaml'))
+          if not files:
+              print('no workflow files found'); sys.exit(1)
+          for f in files:
+              try:
+                  with open(f) as fh:
+                      data = yaml.safe_load(fh)
+                  jobs = data.get('jobs') if isinstance(data, dict) else None
+                  print(f'OK   {f}  ({len(jobs or {})} job(s))')
+                  if not jobs:
+                      bad += 1
+              except Exception as e:
+                  print(f'FAIL {f}: {e}')
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+          for f in scripts/*.sh scripts/macos/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f" && echo "OK   $f"
+          done
+
+      - name: Install Linux system dependencies (Tauri 2)
+        if: steps.desktop.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf pkg-config libssl-dev build-essential curl wget file libxdo-dev
+          pkg-config --modversion webkit2gtk-4.1
+
+      - name: Set up Rust
+        if: steps.desktop.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        if: steps.desktop.outputs.present == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Set up Node
+        if: steps.desktop.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            desktop/ui/package-lock.json
+
+      - name: Install npm dependencies
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+
+      - name: cargo fmt --check
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: cargo clippy (-D warnings)
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: cargo test
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: cargo check
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build launcher UI
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: |
+          if grep -q '"build:ui"' package.json; then
+            npm run build:ui
+          else
+            echo "::notice::no build:ui script in desktop/package.json"
+          fi
+          if [ -d ui/dist ]; then
+            echo "ui/dist: $(find ui/dist -type f | wc -l) files"
+          fi
+
+  macos-check:
+    name: macOS — cargo test + universal .dmg build
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect desktop workspace
+        id: desktop
+        run: |
+          if [ -f desktop/src-tauri/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::desktop/src-tauri/Cargo.toml is not present on this ref yet — the macOS build steps are skipped."
+          fi
+
+      - name: Set up Rust
+        if: steps.desktop.outputs.present == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo
+        if: steps.desktop.outputs.present == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Set up Node
+        if: steps.desktop.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            desktop/ui/package-lock.json
+
+      - name: cargo test (Rust core, macOS)
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: desktop
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build unsigned/ad-hoc universal .dmg
+        if: steps.desktop.outputs.present == 'true'
+        working-directory: .
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          scripts/build-macos.sh --output-dir dist 2>&1 | tee dist/build-console.log
+          RC=${PIPESTATUS[0]}
+          echo "build-macos.sh exit=$RC"
+          # The script already exits non-zero without a .dmg; enforce it here too.
+          ls -la dist/
+          test -n "$(find dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          exit "$RC"
+
+      - name: Report signing reality (no false claims)
+        if: steps.desktop.outputs.present == 'true' && always()
+        run: |
+          {
+            echo "### Signing reality"
+            echo ""
+            if [ -f dist/bundle-verification.txt ]; then
+              echo '```'
+              cat dist/bundle-verification.txt
+              echo '```'
+            else
+              echo "No bundle produced, so no signature to inspect."
+            fi
+            echo ""
+            echo "No Apple Developer ID certificate or notarization credentials exist for this project."
+            echo "The .dmg produced here is ad-hoc signed/unsigned and NOT notarized; Gatekeeper will"
+            echo "require an explicit user override on another Mac. See docs/MACOS-BUILD.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload macOS build artifacts
+        if: steps.desktop.outputs.present == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rast-desktop-macos-dmg-${{ github.sha }}
+          path: |
+            dist/*.dmg
+            dist/*.app
+            dist/bundle-verification.txt
+            dist/build-environment.txt
+            dist/*.log
+            dist/SHA256SUMS-dmg.txt
+          if-no-files-found: warn
+          retention-days: 14

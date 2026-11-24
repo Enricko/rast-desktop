@@ -1,0 +1,143 @@
+name: Release
+
+# Build the universal macOS .dmg on a real macOS runner and attach it to a
+# GitHub Release when a version tag is pushed (`v*`).
+#
+# SCOPE / HONEST LIMITS (docs/MACOS-BUILD.md, docs/PACKAGING.md):
+#   * the .app is ad-hoc signed / unsigned — there is NO Apple Developer ID
+#     certificate in this project, so code signing with a real identity and
+#     notarization are BLOCKED and are NOT performed or claimed here;
+#   * no auto-updater is implemented or claimed: releases are manual downloads,
+#     verified by SHA-256;
+#   * the official Xpra client is NOT bundled (GPLv2+, see docs/LICENSING.md);
+#     users install it from xpra.org.
+#
+# Secrets: none required for the build. If a Developer ID identity and Apple
+# credentials are ever provisioned (APPLE_SIGNING_IDENTITY, APPLE_ID,
+# APPLE_PASSWORD, APPLE_TEAM_ID as repository secrets), the Tauri bundler picks
+# them up automatically and the logs will show a real signature; until then the
+# produced DMG is explicitly unsigned/ad-hoc.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos-release:
+    name: macOS universal DMG + GitHub Release
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require the desktop workspace
+        run: |
+          if [ ! -f desktop/src-tauri/Cargo.toml ]; then
+            echo "::error::desktop/src-tauri/Cargo.toml is missing — cannot build a release .dmg from this ref"
+            exit 1
+          fi
+
+      - name: Set up Rust (universal targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri -> target
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            desktop/package-lock.json
+            desktop/ui/package-lock.json
+
+      - name: Build unsigned/ad-hoc universal .dmg
+        run: |
+          set -o pipefail
+          scripts/build-macos.sh --output-dir dist 2>&1 | tee dist/build-console.log
+          RC=${PIPESTATUS[0]}
+          test -n "$(find dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          exit "$RC"
+
+      - name: Collect release assets + checksums
+        run: |
+          set -euo pipefail
+          ls -la dist/
+          {
+            echo "release build: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "commit: ${GITHUB_SHA}"
+            echo "ref: ${GITHUB_REF}"
+            echo "runner: ${RUNNER_NAME} / $(sw_vers -productVersion)"
+            echo "signing: UNSIGNED or AD-HOC — no Developer ID certificate; NOT notarized"
+          } > dist/RELEASE-NOTES.txt
+          ( cd dist && shasum -a 256 *.dmg > SHA256SUMS-dmg.txt && cat SHA256SUMS-dmg.txt )
+          cp dist/build-environment.txt dist/bundle-verification.txt dist/RELEASE-NOTES.txt dist/ 2>/dev/null || true
+
+      - name: Upload build artifacts (always available from the run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rast-desktop-release-${{ github.ref_name }}
+          path: |
+            dist/*.dmg
+            dist/SHA256SUMS-dmg.txt
+            dist/RELEASE-NOTES.txt
+            dist/build-*.log
+            dist/bundle-verification.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            dist/*.dmg
+            dist/SHA256SUMS-dmg.txt
+            dist/RELEASE-NOTES.txt
+          generate_release_notes: true
+          body: |
+            ## RAST Desktop ${{ github.ref_name }}
+
+            Universal macOS build (Apple Silicon + Intel).
+
+            ### Signing and notarization — read this first
+            This build is **unsigned / ad-hoc signed and NOT notarized**: the
+            project has no Apple Developer ID certificate or notarization
+            credentials yet. On first launch macOS Gatekeeper will refuse it;
+            allow it explicitly with either:
+
+            ```bash
+            xattr -dr com.apple.quarantine "/Applications/RAST Desktop.app"
+            ```
+            or System Settings → Privacy & Security → "Open Anyway".
+
+            Verify the download:
+            ```bash
+            shasum -a 256 -c SHA256SUMS-dmg.txt
+            ```
+
+            ### Requirements
+            * macOS 12 or newer (Apple Silicon primary, Intel supported by the
+              universal build);
+            * the official Xpra macOS client from https://xpra.org (not
+              bundled — GPLv2+, see docs/LICENSING.md);
+            * a RAST server reachable over HTTPS.
+
+            ### Not included / not claimed
+            Code signing with a Developer ID, notarization, and automatic updates
+            are **not implemented**. See docs/MACOS-BUILD.md and
+            docs/PACKAGING.md for the exact status and blockers.
