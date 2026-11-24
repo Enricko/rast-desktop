@@ -1,0 +1,229 @@
+name: Phase 1 native Xpra verification (macOS)
+
+# Phase 1 evidence: attach the OFFICIAL native Xpra macOS client (installed from
+# xpra.org, not bundled) to the live RAST server from a real macOS runner and
+# record honest, reproducible evidence:
+#
+#   * which attach path was used:
+#       broker  — production Phase 3 design: single-use stream token from
+#                 POST /api/linux-apps/session/stream-token. Until the server
+#                 advertised via bootstrap.desktop.streamTokens is deployed this
+#                 endpoint returns 404 and the job fails with a clear
+#                 "server does not support desktop.streamTokens yet" message.
+#       relay   — Phase 1 PoC fallback that works on the current 0.18.3 server:
+#                 the existing authenticated HTML5 relay /linux-apps/session/<key>/
+#                 with the client sending Origin + login cookie headers.
+#   * client attach success, Xpra version, validated argv, negotiated encodings
+#     (client log + `xpra info`), macOS window evidence (CoreGraphics + AppleScript),
+#     screenshots, server-side session state + admin audit log, reconnection with a
+#     fresh credential and timings.
+#   * same-runner HTML5 streaming baseline (Playwright Chromium) where feasible.
+#
+# Requirements: repository secrets RAST_TEST_URL, RAST_TEST_USER,
+# RAST_TEST_PASSWORD and (for server-side audit) RAST_ADMIN_USER,
+# RAST_ADMIN_PASSWORD. XPRA_WEBSOCKET_MASK=1 is mandatory for every attach (see
+# docs/PROTOCOL.md §5): the official client sends unmasked WebSocket frames by
+# default, which a standards-compliant relay must reject.
+#
+# Runner reality: macos-15 = Apple Silicon, macos-15-intel = Intel. The
+# macos-14/macos-13 labels used in older plans are retired.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Attach path: auto (broker if deployed, else relay PoC), broker, relay"
+        type: choice
+        options: [auto, broker, relay]
+        default: auto
+      runner:
+        description: "Runner label (macos-15 = Apple Silicon, macos-15-intel = Intel)"
+        type: choice
+        options: [macos-15, macos-15-intel]
+        default: macos-15
+      app:
+        description: "Preferred discovered app name (empty = lightest terminal app)"
+        type: string
+        default: ""
+      html5:
+        description: "Also run the same-runner HTML5 streaming comparison"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-poc.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-poc-${{ inputs.runner || 'macos-15' }}-${{ inputs.mode || 'auto' }}
+  cancel-in-progress: true
+
+jobs:
+  native-attach:
+    name: Native Xpra attach (${{ inputs.runner || 'macos-15' }}, ${{ inputs.mode || 'auto' }})
+    runs-on: ${{ inputs.runner || 'macos-15' }}
+    timeout-minutes: 60
+
+    env:
+      EVIDENCE_DIR: evidence/phase1
+      RAST_URL: ${{ secrets.RAST_TEST_URL }}
+      RAST_USER: ${{ secrets.RAST_TEST_USER }}
+      RAST_PASSWORD: ${{ secrets.RAST_TEST_PASSWORD }}
+      RAST_ADMIN_USER: ${{ secrets.RAST_ADMIN_USER }}
+      RAST_ADMIN_PASSWORD: ${{ secrets.RAST_ADMIN_PASSWORD }}
+      PHASE1_APP: ${{ inputs.app || '' }}
+      PHASE1_MODE: ${{ inputs.mode || 'auto' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare evidence directory
+        run: |
+          mkdir -p "$EVIDENCE_DIR/api" "$EVIDENCE_DIR/html5"
+          {
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "commit=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF}"
+            echo "runner_label=${{ inputs.runner || 'macos-15' }}"
+            echo "mode=${{ inputs.mode || 'auto' }}"
+            echo "workflow=native-poc.yml"
+          } > "$EVIDENCE_DIR/run-context.txt"
+
+      - name: Resolve architecture
+        run: |
+          set -euo pipefail
+          case "${{ inputs.runner || 'macos-15' }}" in
+            macos-15)       ARCH=arm64 ;;
+            macos-15-intel) ARCH=x86_64 ;;
+            *) echo "::error::unsupported runner label"; exit 1 ;;
+          esac
+          echo "XPRA_ARCH=$ARCH" >> "$GITHUB_ENV"
+          echo "runner arch: $ARCH"
+
+      - name: Cache official Xpra .dmg (arm64)
+        if: inputs.runner != 'macos-15-intel'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xpra-client/Xpra-arm64.dmg
+          key: xpra-macos-arm64-7.0-r0-01161232928ff2e724ef8ea402d9029c399218bf
+
+      - name: Cache official Xpra .dmg (x86_64)
+        if: inputs.runner == 'macos-15-intel'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/xpra-client/Xpra-x86_64.dmg
+          key: xpra-macos-x86_64-7.0-r0-3999aed9965dc2422d3c983a70dd8439e033fc52
+
+      - name: Install official Xpra client (xpra.org, SHA-1 verified)
+        run: |
+          set -euo pipefail
+          bash scripts/macos/install-xpra-client.sh --arch "$XPRA_ARCH" --dest "$RUNNER_TEMP/xpra-client" \
+            | tee "$EVIDENCE_DIR/xpra-install.log"
+          BIN=$(grep -m1 '^XPRA_BINARY=' "$RUNNER_TEMP/xpra-client/install-report.txt" | cut -d= -f2-)
+          MOUNT=$(grep -m1 '^XPRA_MOUNT=' "$RUNNER_TEMP/xpra-client/install-report.txt" | cut -d= -f2-)
+          echo "XPRA_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "XPRA_MOUNT=$MOUNT" >> "$GITHUB_ENV"
+          cp "$RUNNER_TEMP/xpra-client/install-report.txt" "$EVIDENCE_DIR/xpra-install-report.txt"
+          cp "$RUNNER_TEMP/xpra-client/hdiutil-attach.log" "$EVIDENCE_DIR/" 2>/dev/null || true
+          "$BIN" --version | tee "$EVIDENCE_DIR/xpra-version-smoke.log"
+
+      - name: Server capability precheck
+        run: |
+          set -uo pipefail
+          HTTP=$(curl -sS -m 60 -o "$EVIDENCE_DIR/api/bootstrap-precheck.json" -w '%{http_code}' "$RAST_URL/api/bootstrap" || echo 000)
+          echo "GET $RAST_URL/api/bootstrap -> HTTP $HTTP"
+          jq -c '{version, desktop}' "$EVIDENCE_DIR/api/bootstrap-precheck.json" 2>/dev/null || cat "$EVIDENCE_DIR/api/bootstrap-precheck.json"
+          DESKTOP=$(jq -r '.desktop // empty' "$EVIDENCE_DIR/api/bootstrap-precheck.json" 2>/dev/null)
+          STREAM_TOKENS=$(jq -r '.desktop.streamTokens // false' "$EVIDENCE_DIR/api/bootstrap-precheck.json" 2>/dev/null)
+          if [ "$STREAM_TOKENS" = "true" ]; then
+            echo "server advertises desktop.streamTokens=true (Phase 3 broker available)"
+          else
+            echo "::notice::server does not support desktop.streamTokens yet (bootstrap.desktop is absent or streamTokens=false); broker attach is expected to be unavailable until the RAST update is deployed. The workflow will record that precisely and fall back to the relay PoC path when mode=auto."
+          fi
+
+      - name: Phase 1 native verification
+        env:
+          XPRA_WEBSOCKET_MASK: "1"
+        run: |
+          set -o pipefail
+          ARGS=(--mode "$PHASE1_MODE")
+          if [ -n "${PHASE1_APP:-}" ]; then ARGS+=(--app "$PHASE1_APP"); fi
+          bash scripts/macos/phase1-native-verify.sh "${ARGS[@]}" 2>&1 | tee "$EVIDENCE_DIR/verify-console.log"
+          RC=${PIPESTATUS[0]}
+          echo "phase1 verify exit code: $RC"
+          exit "$RC"
+
+      - name: Install Playwright Chromium (HTML5 baseline)
+        if: always() && inputs.html5
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/h5"
+          cd "$RUNNER_TEMP/h5"
+          npm init -y >/dev/null 2>&1
+          npm i playwright --no-audit --no-fund | tail -3
+          npx playwright install chromium | tail -5
+          node -e "console.log('playwright', require('playwright/package.json').version)" | tee "$GITHUB_WORKSPACE/$EVIDENCE_DIR/html5/playwright-version.txt"
+
+      - name: HTML5 streaming baseline (same runner/account/network)
+        if: always() && inputs.html5
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cp scripts/macos/html5-compare.cjs "$RUNNER_TEMP/h5/html5-compare.cjs"
+          cd "$RUNNER_TEMP/h5"
+          node html5-compare.cjs --url "$RAST_URL" --user "$RAST_USER" --password "$RAST_PASSWORD" \
+            --app "${PHASE1_APP:-}" --out "$GITHUB_WORKSPACE/$EVIDENCE_DIR/html5" \
+            2>&1 | tee "$GITHUB_WORKSPACE/$EVIDENCE_DIR/html5-compare.log" || true
+          echo "HTML5 baseline log written (failures are recorded in html5.json, not fatal to the native evidence)"
+
+      - name: Cleanup (always; only what this workflow started)
+        if: always()
+        run: |
+          bash scripts/macos/phase1-cleanup.sh --evidence-dir "$EVIDENCE_DIR" 2>&1 | tee -a "$EVIDENCE_DIR/cleanup-console.log"
+        env:
+          RAST_URL: ${{ secrets.RAST_TEST_URL }}
+          RAST_USER: ${{ secrets.RAST_TEST_USER }}
+          RAST_PASSWORD: ${{ secrets.RAST_TEST_PASSWORD }}
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "# Phase 1 native Xpra verification — macOS"
+            echo ""
+            echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ""
+            echo '## Native client evidence'
+            echo '```'
+            cat "$EVIDENCE_DIR/summary.md" 2>/dev/null || echo "no summary (verification did not reach the summary stage)"
+            echo '```'
+            if [ -f "$EVIDENCE_DIR/html5/html5.json" ]; then
+              echo ""
+              echo '## HTML5 baseline (same runner/account/network)'
+              echo '```json'
+              cat "$EVIDENCE_DIR/html5/html5.json"
+              echo '```'
+            fi
+            echo ""
+            echo '## Cleanup'
+            echo '```'
+            cat "$EVIDENCE_DIR/cleanup.log" 2>/dev/null || true
+            cat "$EVIDENCE_DIR/cleanup-console.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase1-native-macos-${{ inputs.runner || 'macos-15' }}-${{ github.run_id }}
+          path: |
+            ${{ env.EVIDENCE_DIR }}/
+          if-no-files-found: warn
+          retention-days: 30
