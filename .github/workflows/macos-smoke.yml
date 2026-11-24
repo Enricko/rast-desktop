@@ -1,0 +1,297 @@
+name: macOS smoke (Xpra client + RAST network)
+
+# GO/NO-GO feasibility check for the macOS verification plan:
+#   * real macOS runner hardware (Apple Silicon + Intel),
+#   * toolchain versions available out of the box,
+#   * network path to the live RAST server,
+#   * download + mount of the OFFICIAL Xpra macOS client from xpra.org,
+#   * `Xpra --version` actually executing on macOS,
+#   * informational GUI/TCC probes (accessibility / screen recording).
+#
+# This workflow is the evidence generator for the macOS smoke report; it does
+# not test RAST Desktop itself (that is native-poc.yml / ci.yml).
+#
+# Runner labels: GitHub retired the macOS 14 image on 2026-11-02 and macOS 13
+# long before that (see actions/runner-images), so the current standard hosted
+# images are `macos-15` (Apple Silicon) and `macos-15-intel` (Intel). Both are
+# free for public repositories. If a label disappears, this workflow fails
+# loudly at the "system information" step instead of silently skipping.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macos-smoke.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: macOS smoke (${{ matrix.label }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-15
+            arch: arm64
+            dmg_url: https://xpra.org/stable/MacOS/arm64/Xpra-arm64-7.0-r0.dmg
+            dmg_sha1: 01161232928ff2e724ef8ea402d9029c399218bf
+          - label: macos-15-intel
+            arch: x86_64
+            dmg_url: https://xpra.org/stable/MacOS/x86_64/Xpra-x86_64-7.0-r0.dmg
+            dmg_sha1: 3999aed9965dc2422d3c983a70dd8439e033fc52
+
+    env:
+      LOG_DIR: ${{ github.workspace }}/smoke-logs
+      RAST_URL: https://desktop.lufria.tech
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare log directory
+        run: |
+          mkdir -p "$LOG_DIR"
+          echo "runner_label=${{ matrix.label }}" > "$LOG_DIR/env.txt"
+          echo "runner_arch_expected=${{ matrix.arch }}" >> "$LOG_DIR/env.txt"
+          echo "run_id=${GITHUB_RUN_ID} run_attempt=${GITHUB_RUN_ATTEMPT} sha=${GITHUB_SHA}" >> "$LOG_DIR/env.txt"
+
+      - name: System information
+        run: |
+          set -euo pipefail
+          {
+            echo '=== sw_vers ==='
+            sw_vers
+            echo
+            echo '=== uname -a ==='
+            uname -a
+            echo
+            echo "=== uname -m (expected ${{ matrix.arch }}) ==="
+            ARCH=$(uname -m)
+            echo "$ARCH"
+            if [ "$ARCH" != "${{ matrix.arch }}" ]; then
+              echo "::error::runner architecture $ARCH does not match matrix arch ${{ matrix.arch }} (label vanished?)"
+              exit 1
+            fi
+            echo
+            echo '=== hardware ==='
+            sysctl -n hw.model hw.machine hw.ncpu hw.memsize 2>/dev/null || true
+            system_profiler SPHardwareDataType 2>/dev/null | head -30 || true
+            echo
+            echo '=== toolchain ==='
+            echo "bash: $(bash --version | head -1)"
+            echo "python3: $(python3 --version 2>&1)"
+            echo "git: $(git --version 2>&1)"
+            echo "curl: $(curl --version | head -1)"
+            echo "jq: $(jq --version 2>&1)"
+            echo "hdiutil: $(command -v hdiutil)"
+            echo "rustc: $(rustc --version 2>&1 || echo MISSING)"
+            echo "cargo: $(cargo --version 2>&1 || echo MISSING)"
+            echo "rustup: $(rustup --version 2>&1 | head -1 || echo MISSING)"
+            echo "node: $(node --version 2>&1 || echo MISSING)"
+            echo "npm: $(npm --version 2>&1 || echo MISSING)"
+            echo "xcodebuild: $(xcodebuild -version 2>&1 | tr '\n' ' ' || echo MISSING)"
+            echo "brew: $(brew --version 2>&1 | head -1 || echo MISSING)"
+          } 2>&1 | tee "$LOG_DIR/system-info.log"
+
+      - name: Network path to RAST server
+        run: |
+          set -uo pipefail
+          {
+            echo "=== curl -I $RAST_URL/api/bootstrap ==="
+            curl -sS -m 30 -I "$RAST_URL/api/bootstrap" || echo "HEAD failed rc=$?"
+            echo
+            echo "=== GET $RAST_URL/api/bootstrap ==="
+            code=$(curl -sS -m 30 -o "$LOG_DIR/bootstrap.json" -w '%{http_code}' "$RAST_URL/api/bootstrap" || echo 000)
+            echo "http_status=$code"
+            cat "$LOG_DIR/bootstrap.json" 2>/dev/null; echo
+            if [ "$code" = "200" ]; then
+              echo "=== parsed bootstrap ==="
+              jq -c '{product,version,authenticated,setupRequired}' "$LOG_DIR/bootstrap.json" 2>/dev/null || true
+            else
+              echo "::warning::bootstrap returned HTTP $code"
+            fi
+            echo
+            echo '=== DNS/TLS detail ==='
+            curl -sS -m 30 -o /dev/null -w 'http_code=%{http_code} dns=%{time_namelookup}s connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' "$RAST_URL/api/bootstrap" || true
+          } 2>&1 | tee "$LOG_DIR/network.log"
+
+      - name: GUI / TCC probe (informational)
+        run: |
+          set -uo pipefail
+          {
+            echo "logged in user: $(id -un) uid=$(id -u) console_user=$(stat -f '%Su' /dev/console 2>/dev/null)"
+            echo
+            echo '=== launchctl gui session ==='
+            launchctl print "gui/$(id -u)" >/dev/null 2>&1 && echo 'launchctl gui/<uid> OK (GUI session present)' || echo "launchctl gui/<uid> FAILED rc=$?"
+            echo
+            echo '=== Accessibility (System Events AppleScript) ==='
+            out=$(osascript -e 'tell application "System Events" to count processes' 2>&1); rc=$?
+            echo "osascript rc=$rc output=$out"
+            echo
+            echo '=== Screen Recording (screencapture) ==='
+            rm -f /tmp/tcc-probe.png
+            screencapture -x /tmp/tcc-probe.png 2>&1; rc=$?
+            echo "screencapture rc=$rc"
+            if [ -f /tmp/tcc-probe.png ]; then
+              echo "screenshot size bytes: $(stat -f%z /tmp/tcc-probe.png)"
+              cp /tmp/tcc-probe.png "$LOG_DIR/tcc-probe.png" 2>/dev/null || true
+            else
+              echo 'no screenshot produced'
+            fi
+          } 2>&1 | tee "$LOG_DIR/tcc-probe.log"
+
+      - name: Download official Xpra macOS client
+        run: |
+          set -euo pipefail
+          {
+            echo "url=${{ matrix.dmg_url }}"
+            echo "expected_sha1=${{ matrix.dmg_sha1 }}"
+            echo '=== HTTP headers ==='
+            curl -sS -m 60 -I -L "${{ matrix.dmg_url }}" | grep -iE '^HTTP|content-length|content-type|last-modified' || true
+            echo
+            echo '=== download (retry x3) ==='
+            curl -fL --retry 3 --retry-delay 5 --retry-all-errors -m 600 \
+              -o /tmp/Xpra.dmg "${{ matrix.dmg_url }}" \
+              -w 'dmg_http_code=%{http_code} size=%{size_download} speed=%{speed_download}B/s total=%{time_total}s\n'
+          } 2>&1 | tee "$LOG_DIR/xpra-download.log"
+          echo
+          echo '=== verify SHA-1 against value published by xpra.org ==='
+          actual=$(shasum -a 1 /tmp/Xpra.dmg | awk '{print $1}')
+          echo "actual_sha1=$actual"
+          echo "published_sha1=${{ matrix.dmg_sha1 }}"
+          if [ "$actual" != "${{ matrix.dmg_sha1 }}" ]; then
+            echo '::error::Xpra DMG SHA-1 mismatch'
+            exit 1
+          fi
+          echo 'SHA-1 OK'
+          ls -l /tmp/Xpra.dmg
+
+      - name: Mount DMG, inspect bundle, run Xpra --version
+        run: |
+          set -uo pipefail
+          exec > >(tee "$LOG_DIR/xpra-client.log") 2>&1
+          MP=/tmp/xpra-mnt
+          mkdir -p "$MP"
+          echo '=== hdiutil attach ==='
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$MP" /tmp/Xpra.dmg; ATTACH_RC=$?
+          echo "hdiutil rc=$ATTACH_RC"
+          if [ "$ATTACH_RC" -ne 0 ]; then
+            echo '::error::hdiutil attach failed'
+            exit 1
+          fi
+          echo
+          echo '=== mounted contents ==='
+          ls -la "$MP"
+          echo
+          APP=$(find "$MP" -maxdepth 2 -name '*.app' -print -quit)
+          echo "app_path=$APP"
+          if [ -z "${APP:-}" ]; then
+            echo '::error::no .app found in mounted DMG'
+            hdiutil detach "$MP" -force || true
+            exit 1
+          fi
+          echo
+          echo '=== Info.plist (bundle identity) ==='
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist" 2>/dev/null || true
+          echo
+          echo '=== bundle executable layout ==='
+          ls -la "$APP/Contents/MacOS" | head -40
+          echo
+          XPRA="$APP/Contents/MacOS/Xpra"
+          if [ ! -x "$XPRA" ]; then
+            echo "::error::missing executable $XPRA"
+            hdiutil detach "$MP" -force || true
+            exit 1
+          fi
+          echo "=== $XPRA --version (60s timeout) ==="
+          python3 - "$XPRA" --version <<'PY' 2>&1 | tail -40
+          import subprocess, sys
+          try:
+              r = subprocess.run(sys.argv[1:], timeout=60, capture_output=True, text=True)
+              print("exit_code=", r.returncode)
+              print("--- stdout ---"); print(r.stdout[-8000:])
+              print("--- stderr ---"); print(r.stderr[-8000:])
+          except subprocess.TimeoutExpired as e:
+              print("TIMEOUT after 60s")
+              print("--- stdout so far ---"); print((e.stdout or b"").decode(errors="replace")[-4000:] if isinstance(e.stdout, bytes) else (e.stdout or "")[-4000:])
+              print("--- stderr so far ---"); print((e.stderr or b"").decode(errors="replace")[-4000:] if isinstance(e.stderr, bytes) else (e.stderr or "")[-4000:])
+              sys.exit(124)
+          PY
+          VERSION_RC=$?
+          echo "xpra_version_rc=$VERSION_RC"
+          echo
+          echo '=== xpra attach --help probe (flag availability) ==='
+          python3 - "$XPRA" attach --help <<'PY' 2>&1 | tee "$LOG_DIR/xpra-attach-help.log" | tail -5
+          import subprocess, sys
+          try:
+              r = subprocess.run(sys.argv[1:], timeout=120, capture_output=True, text=True)
+              out = r.stdout or ""
+              err = r.stderr or ""
+              print("exit_code=", r.returncode, "stdout_bytes=", len(out), "stderr_bytes=", len(err))
+              import pathlib
+              pathlib.Path(__import__("os").environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stdout.txt").write_text(out)
+              pathlib.Path(__import__("os").environ.get("LOG_DIR", "smoke-logs") + "/xpra-attach-help.stderr.txt").write_text(err)
+              for flag in ["--sharing", "--clipboard", "--audio", "--encodings", "--quality", "--min-quality",
+                           "--speed", "--min-speed", "--video-scaling", "--av-sync", "--opengl", "--dpi",
+                           "--no-mdns", "--no-printing", "--no-webcam", "--notifications", "--exit-with-client"]:
+                  print(f"flag {flag}: {'present' if flag in out else 'ABSENT'}")
+          except subprocess.TimeoutExpired:
+              print("TIMEOUT after 120s"); sys.exit(124)
+          PY
+          echo "xpra_attach_help_rc=$?"
+          echo
+          echo '=== detach DMG ==='
+          hdiutil detach "$MP" -force
+          echo "detach rc=$?"
+          echo
+          if [ "$VERSION_RC" -ne 0 ]; then
+            echo "::error::Xpra --version exited rc=$VERSION_RC"
+            exit 1
+          fi
+          echo 'XPRA_CLIENT_OK'
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo '## macOS smoke — ${{ matrix.label }} (${{ matrix.arch }})'
+            echo ''
+            echo "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo ''
+            echo '### System'
+            echo '```'
+            sed -n '1,30p' "$LOG_DIR/system-info.log" 2>/dev/null || true
+            echo '```'
+            echo '### RAST network'
+            echo '```'
+            tail -20 "$LOG_DIR/network.log" 2>/dev/null || true
+            echo '```'
+            echo '### Xpra client'
+            echo '```'
+            tail -60 "$LOG_DIR/xpra-client.log" 2>/dev/null || true
+            echo '```'
+            echo '### GUI/TCC probes'
+            echo '```'
+            cat "$LOG_DIR/tcc-probe.log" 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke-logs-${{ matrix.label }}-${{ matrix.arch }}
+          path: ${{ github.workspace }}/smoke-logs/
+          if-no-files-found: warn
+          retention-days: 30
