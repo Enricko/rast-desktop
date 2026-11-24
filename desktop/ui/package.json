@@ -1,0 +1,22 @@
+{
+  "name": "rast-desktop-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "RAST Desktop launcher UI — Tauri WebView, mock-testable in a browser",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "mock": "vite build && node scripts/serve.mjs",
+    "preview": "vite preview --port 4173 --strictPort",
+    "screenshots": "node scripts/screenshot.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.5"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}
